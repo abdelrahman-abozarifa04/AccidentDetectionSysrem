@@ -1,0 +1,66 @@
+# General
+*.log
+.*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*.bak
+*.cache
+*.pid
+*.pid.lock
+*.seed
+*.coverage
+*.lcov
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+dist/
+build/
+.vite/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+coverage/
+htmlcov/
+
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.nupkg
+*.snupkg
+
+# IDEs and editors
+.vs/
+.vscode/
+.idea/
+
+# Local caches
+.localappdata/
+.npm-cache/
+.nuget/
+.nuget-appdata/
