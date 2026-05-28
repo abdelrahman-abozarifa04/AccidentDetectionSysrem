@@ -1,6 +1,6 @@
 """
 FastAPI Backend for Smart Road Monitor AI Analysis
-Deploy this to HuggingFace Spaces or any cloud provider
+Integrating ultralytics YOLO for Road Anomaly and Accident Detection.
 """
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -9,8 +9,11 @@ from pydantic import BaseModel
 from typing import List, Optional
 import logging
 import io
+import os
+import time
 from PIL import Image
 import uvicorn
+from ultralytics import YOLO
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -18,61 +21,174 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Smart Road Monitor AI API",
-    description="API for road defect detection and analysis",
+    description="API for road defect and accident detection using YOLO",
     version="1.0.0"
 )
 
 # ============================
-# CORS CONFIGURATION - CRITICAL
+# CORS CONFIGURATION
 # ============================
-# This allows your React frontend to make requests to this backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "*",  # Allow all origins (development only)
-        # "https://your-frontend-url.vercel.app",  # Production frontend URL
-        # "http://localhost:5173",  # Local Vite dev server
-        # "http://localhost:5174",
-    ],
+    allow_origins=["*"],  # Allow all origins for development and deployment
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
+# ============================
+# YOLO MODEL INITIALIZATION
+# ============================
+model = None
+
+def load_yolo_model():
+    """Loads custom best.pt weights if present, falling back to yolov8n.pt"""
+    global model
+    try:
+        model_path = "best.pt"
+        if os.path.exists(model_path):
+            logger.info(f"Loading custom YOLO weights from '{model_path}'...")
+            model = YOLO(model_path)
+        else:
+            logger.info("Custom model 'best.pt' not found in workspace. Falling back to pre-trained 'yolov8n.pt'...")
+            model = YOLO("yolov8n.pt")
+        logger.info("YOLO model initialized successfully!")
+    except Exception as e:
+        logger.error(f"Failed to load YOLO model: {str(e)}", exc_info=True)
+        # Attempt to load on demand if startup fails
+
+@app.on_event("startup")
+async def startup_event():
+    load_yolo_model()
+
+# ============================
+# TAXONOMY MAPPING & SEVERITY
+# ============================
+def map_class_to_type(class_name: str) -> str:
+    """Maps custom YOLO or COCO classes to a normalized system taxonomy."""
+    class_lower = class_name.lower().strip()
+    
+    # Severe Accident Indicators
+    accident_keywords = ["accident", "crash", "collision", "fire", "smoke", "overturned", "wreckage"]
+    if any(kw in class_lower for kw in accident_keywords):
+        return "accident"
+    
+    # Road Anomalies / Pavement deterioration
+    anomaly_keywords = ["pothole", "crack", "defect", "rutting", "bump", "depression", "debris", "hole", "road_defect"]
+    if any(kw in class_lower for kw in anomaly_keywords):
+        return "anomaly"
+    
+    # Standard Telemetry/Objects
+    vehicle_keywords = ["car", "truck", "bus", "motorcycle", "vehicle", "van", "bicycle"]
+    if any(kw in class_lower for kw in vehicle_keywords):
+        return "vehicle"
+        
+    pedestrian_keywords = ["person", "pedestrian", "walker"]
+    if any(kw in class_lower for kw in pedestrian_keywords):
+        return "pedestrian"
+        
+    return "other"
+
+def run_inference(image: Image.Image):
+    """Executes YOLO model on PIL Image and extracts normalized telemetry features."""
+    global model
+    if model is None:
+        load_yolo_model()
+    if model is None:
+        raise RuntimeError("YOLO model could not be initialized.")
+
+    start_time = time.time()
+    results = model(image)
+    processing_time = time.time() - start_time
+
+    detections = []
+    has_anomaly = False
+    has_accident = False
+    max_confidence = 0.0
+
+    for result in results:
+        # Extract detections
+        for box in result.boxes:
+            cls_id = int(box.cls[0])
+            class_name = model.names[cls_id]
+            confidence = float(box.conf[0])
+            bbox = [float(coord) for coord in box.xyxy[0]]  # [x1, y1, x2, y2]
+            
+            # Categorize the detection
+            det_type = map_class_to_type(class_name)
+            
+            if det_type == "accident":
+                has_accident = True
+            elif det_type == "anomaly":
+                has_anomaly = True
+
+            if confidence > max_confidence:
+                max_confidence = confidence
+
+            detections.append({
+                "class_name": class_name,
+                "type": det_type,
+                "confidence": round(confidence, 4),
+                "bbox": [round(c, 2) for c in bbox]
+            })
+
+    # Calculate overall severity
+    if has_accident:
+        severity = "critical"
+    elif has_anomaly:
+        severity = "high" if max_confidence > 0.8 else "medium"
+    elif len(detections) > 0:
+        severity = "low"
+    else:
+        severity = "none"
+
+    return detections, has_anomaly, has_accident, severity, max_confidence, processing_time
 
 # ============================
 # REQUEST/RESPONSE MODELS
 # ============================
+class Detection(BaseModel):
+    class_name: str
+    type: str  # "anomaly", "accident", "vehicle", "pedestrian", "other"
+    confidence: float
+    bbox: List[float]
+
 class AnalysisResult(BaseModel):
     status: str
     message: str
     model_name: str
-    detections: List[dict]
+    camera_id: str
+    analysis_type: Optional[str]
+    location: Optional[str]
+    filename: str
+    detections: List[Detection]
+    has_anomaly: bool
+    has_accident: bool
+    severity: str  # "none", "low", "medium", "high", "critical"
     confidence: float
     processing_time: float
-
+    image_size: dict  # {"width": int, "height": int}
 
 # ============================
-# HEALTH CHECK ENDPOINT
+# ENDPOINTS
 # ============================
 @app.get("/")
 async def root():
+    model_loaded = "None" if model is None else getattr(model, "ckpt_path", "Loaded")
     return {
         "status": "online",
         "message": "Smart Road Monitor AI API is running",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "model_loaded": model_loaded
     }
-
 
 @app.get("/health")
 async def health_check():
+    if model is None:
+        return {"status": "unhealthy", "error": "Model not loaded"}
     return {"status": "healthy"}
 
-
-# ============================
-# PREDICTION ENDPOINT
-# ============================
-@app.post("/predict/{model_name}")
+@app.post("/predict/{model_name}", response_model=AnalysisResult)
 async def predict(
     model_name: str,
     file: UploadFile = File(..., description="Image file to analyze"),
@@ -82,81 +198,71 @@ async def predict(
     notes: Optional[str] = Form(None, description="Additional notes")
 ):
     """
-    Analyze an image for road defects using the specified model.
-    
-    - **model_name**: Name of the AI model to use (e.g., "yolov8")
-    - **file**: Image file to analyze (JPG, PNG, WEBP)
-    - **camera_id**: Camera identifier
-    - **analysis_type**: Type of analysis (pothole, crack, etc.)
-    - **location**: Location or Road ID
-    - **notes**: Additional notes
+    Analyze a road image using YOLO to identify Anomalies, Accidents, and Objects.
     """
     try:
-        logger.info(f"Received prediction request: model={model_name}, camera={camera_id}")
-        logger.info(f"File: {file.filename}, Content-Type: {file.content_type}")
+        logger.info(f"Prediction requested: model={model_name}, camera_id={camera_id}, location={location}")
         
-        # Validate file type
+        # Validate File Content-Type
         allowed_types = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
         if file.content_type not in allowed_types:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid file type: {file.content_type}. Allowed: {allowed_types}"
+                detail=f"Unsupported file type: {file.content_type}. Supported: JPEG, PNG, WEBP"
             )
-        
-        # Read and validate image
+
+        # Read File Contents
         contents = await file.read()
         if len(contents) == 0:
-            raise HTTPException(status_code=400, detail="Empty file uploaded")
-        
-        # Validate it's a valid image
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+        # Load into PIL Image
         try:
             image = Image.open(io.BytesIO(contents))
-            image.verify()  # Verify it's a valid image
-            logger.info(f"Valid image: {image.format}, size: {image.size}")
+            width, height = image.size
+            # Convert to RGB (to handle grayscale, RGBA, etc. safely in YOLO)
+            if image.mode != "RGB":
+                image = image.convert("RGB")
         except Exception as e:
-            logger.error(f"Invalid image: {e}")
-            raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
-        
-        # TODO: Add your actual AI model inference here
-        # For now, return mock results
-        result = {
-            "status": "success",
-            "message": f"Analysis complete using {model_name}",
-            "model_name": model_name,
-            "camera_id": camera_id,
-            "analysis_type": analysis_type,
-            "location": location,
-            "filename": file.filename,
-            "detections": [
-                {
-                    "class": "pothole",
-                    "confidence": 0.94,
-                    "bbox": [100, 200, 150, 250]
-                },
-                {
-                    "class": "crack",
-                    "confidence": 0.87,
-                    "bbox": [300, 400, 350, 450]
-                }
-            ],
-            "confidence": 0.91,
-            "processing_time": 1.23,
-            "image_size": {"width": 640, "height": 480}
-        }
-        
-        logger.info(f"Analysis complete: {len(result['detections'])} detections")
-        return result
-        
+            logger.error(f"Image load failure: {str(e)}")
+            raise HTTPException(status_code=400, detail="Invalid image payload.")
+
+        # Run Inference
+        detections, has_anomaly, has_accident, severity, max_conf, proc_time = run_inference(image)
+
+        # Build Response message
+        if has_accident and has_anomaly:
+            msg = "ALERT: Severe accident and road anomalies detected."
+        elif has_accident:
+            msg = "ALERT: Severe accident incident detected."
+        elif has_anomaly:
+            msg = "Road anomalies detected."
+        else:
+            msg = "Road condition is normal. No defects or incidents detected."
+
+        return AnalysisResult(
+            status="success",
+            message=msg,
+            model_name=model_name,
+            camera_id=camera_id,
+            analysis_type=analysis_type,
+            location=location,
+            filename=file.filename,
+            detections=detections,
+            has_anomaly=has_anomaly,
+            has_accident=has_accident,
+            severity=severity,
+            confidence=round(max_conf, 4),
+            processing_time=round(proc_time, 4),
+            image_size={"width": width, "height": height}
+        )
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Prediction error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Prediction Error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal prediction engine error: {str(e)}")
 
-
-# ============================
-# BATCH PREDICTION ENDPOINT
-# ============================
 @app.post("/predict/batch/{model_name}")
 async def predict_batch(
     model_name: str,
@@ -167,42 +273,36 @@ async def predict_batch(
     notes: Optional[str] = Form(None)
 ):
     """
-    Analyze multiple images for road defects.
+    Analyze multiple road images in batch.
     """
     results = []
     
     for file in files:
         try:
             contents = await file.read()
+            image = Image.open(io.BytesIO(contents))
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+                
+            detections, has_anomaly, has_accident, severity, max_conf, proc_time = run_inference(image)
             
-            # Validate image
-            try:
-                image = Image.open(io.BytesIO(contents))
-                image.verify()
-            except Exception:
-                results.append({
-                    "filename": file.filename,
-                    "status": "error",
-                    "message": "Invalid image file"
-                })
-                continue
-            
-            # TODO: Add actual model inference
             results.append({
                 "filename": file.filename,
                 "status": "success",
-                "detections": [
-                    {"class": "pothole", "confidence": 0.94}
-                ]
+                "detections": detections,
+                "has_anomaly": has_anomaly,
+                "has_accident": has_accident,
+                "severity": severity,
+                "confidence": round(max_conf, 4)
             })
-            
         except Exception as e:
+            logger.error(f"Batch prediction failure for {file.filename}: {str(e)}")
             results.append({
                 "filename": file.filename,
                 "status": "error",
                 "message": str(e)
             })
-    
+            
     return {
         "status": "success",
         "model_name": model_name,
@@ -210,23 +310,17 @@ async def predict_batch(
         "results": results
     }
 
-
 # ============================
-# ERROR HANDLERS
+# ERROR HANDLING
 # ============================
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
-    logger.error(f"Global error: {str(exc)}", exc_info=True)
+    logger.error(f"Global exception: {str(exc)}", exc_info=True)
     return {
         "status": "error",
-        "message": "An unexpected error occurred",
+        "message": "An unhandled execution error occurred in the AI backend.",
         "detail": str(exc)
     }
 
-
-# ============================
-# RUN SERVER
-# ============================
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-

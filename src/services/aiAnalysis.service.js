@@ -1,10 +1,9 @@
 /**
  * AI Analysis Service
- * Handles media file analysis requests to the FastAPI backend
+ * Handles media file analysis requests to the FastAPI backend using standard Axios client.
  */
 
-// Use environment variable for API base URL
-const BASE_URL = import.meta.env.VITE_AI_API_BASE_URL || 'http://localhost:8000';
+import { aiApi } from "./api";
 
 /**
  * Analyze a single media file using AI backend
@@ -13,52 +12,53 @@ const BASE_URL = import.meta.env.VITE_AI_API_BASE_URL || 'http://localhost:8000'
  * 
  * @param {File} file - Image file
  * @param {string} modelName - Model name: "detection" | "accident" | "congestion"
+ * @param {Object} options - Optional parameters: { cameraId, location, notes }
  * @returns {Promise<Object>} Analysis result with detections, confidence, etc.
  */
-export const analyzeMedia = async (file, modelName = 'detection') => {
+export const analyzeMedia = async (file, modelName = 'detection', options = {}) => {
   // Validate file
   if (!file) {
     throw new Error('No file provided. Please select an image file.');
   }
 
-  // Create FormData with only "file" field (backend requirement)
+  // Create FormData for prediction payload
   const formData = new FormData();
   formData.append('file', file);
+  
+  // Attach optional parameters if present
+  if (options.cameraId) formData.append('camera_id', options.cameraId);
+  if (options.location) formData.append('location', options.location);
+  if (options.notes) formData.append('notes', options.notes);
 
-  const url = `${BASE_URL}/predict/${modelName}`;
-
-  const response = await fetch(url, {
-    method: 'POST',
-    body: formData,
-    // Do NOT set Content-Type - browser sets multipart boundary automatically
-  });
-
-  // Parse response
-  let data;
-  const contentType = response.headers.get('content-type');
-  if (contentType && contentType.includes('application/json')) {
-    data = await response.json();
-  } else {
-    data = { detail: await response.text() };
+  try {
+    const response = await aiApi.post(`/predict/${modelName}`, formData);
+    return response.data;
+  } catch (error) {
+    // Process and normalize standard Axios errors
+    if (error.response) {
+      const data = error.response.data;
+      const status = error.response.status;
+      
+      const msg = data?.detail || data?.message || `AI prediction failed (HTTP ${status})`;
+      
+      if (status === 404) {
+        throw new Error(`Model "${modelName}" not found. Available models: detection, accident, congestion`);
+      }
+      if (status === 422) {
+        throw new Error('Unprocessable payload. Please upload a valid image (JPEG, PNG, WEBP).');
+      }
+      if (status === 500) {
+        throw new Error(`AI prediction engine server error: ${msg}`);
+      }
+      throw new Error(msg);
+    } else if (error.request) {
+      // The request was made but no response was received
+      throw new Error('AI analysis service is unreachable. Ensure the FastAPI/Hugging Face space is online.');
+    } else {
+      // Something happened in setting up the request that triggered an Error
+      throw new Error(error.message);
+    }
   }
-
-  // Handle errors
-  if (!response.ok) {
-    const msg = data.detail || data.message || `Request failed (${response.status})`;
-    
-    if (response.status === 404) {
-      throw new Error(`Model "${modelName}" not found. Available: detection, accident, congestion`);
-    }
-    if (response.status === 422) {
-      throw new Error(`Invalid file. Please upload a valid image (JPG, PNG, WEBP).`);
-    }
-    if (response.status === 500) {
-      throw new Error('Server error. Please try again later.');
-    }
-    throw new Error(msg);
-  }
-
-  return data;
 };
 
 /**
@@ -78,4 +78,3 @@ export const analyzeMultipleMedia = async (files, modelName = 'detection') => {
   
   return analyzeMedia(file, modelName);
 };
-
